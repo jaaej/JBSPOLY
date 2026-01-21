@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket Trades Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 24px 20px 40px;
+    }
+    h1, h2, h3 {
+      margin: 0 0 12px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    h1 { font-size: 28px; }
+    h2 { font-size: 22px; margin-top: 28px; }
+    h3 { font-size: 18px; margin-top: 18px; }
+    p {
+      margin: 6px 0 14px;
+      color: #cbd5e1;
+    }
+    .panel {
+      background: radial-gradient(circle at 20% 20%, rgba(94, 234, 212, 0.08), transparent 30%), #0b1223;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 14px;
+      padding: 14px 14px 10px;
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.35);
+      margin-bottom: 18px;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    button, label.file-label {
+      background: linear-gradient(135deg, #22c55e, #16a34a);
+      color: #0b1223;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.08s ease, box-shadow 0.1s ease;
+      box-shadow: 0 8px 18px rgba(34, 197, 94, 0.25);
+    }
+    button:hover, label.file-label:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 22px rgba(34, 197, 94, 0.35);
+    }
+    input[type="file"] {
+      display: none;
+    }
+    .status {
+      font-size: 13px;
+      color: #a5b4fc;
+    }
+    .chart-wrap {
+      position: relative;
+      width: 100%;
+      height: 840px;
+      margin-top: 12px;
+    }
+    .market-meta {
+      font-size: 13px;
+      color: #94a3b8;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Polymarket Trades Dashboard</h1>
+    <p>ChartGenerator-style views for each market using scraped trades (ordered by timestamp). Four charts per market: trades + buy volume, cumulative buys, dollar exposure, and shares exposure.</p>
+ 
+    <div class="panel">
+      <div class="controls">
+        <label class="file-label" for="file-input">Load a CSV</label>
+        <input type="file" id="file-input" accept=".csv" />
+        <span class="status" id="status">Idle</span>
+      </div>
+      <div class="controls" style="margin-top:8px; gap:8px;">
+        <button id="reset-zoom">Reset view</button>
+        <span class="status">Pan: drag. Zoom: wheel/pinch. Drag+select zoom also works.</span>
+      </div>
+      <p class="status note">Serve from <code>strategy-scripts</code> (e.g. <code>python3 -m http.server</code>) so <code>activity-exports/all-trades.csv</code> resolves; otherwise use the file picker.</p>
+    </div>
+ 
+    <section id="markets"></section>
+  </main>
+ 
+  <script>
+    (() => {
+      const DEFAULT_PATHS = [
+        "activity-exports/all-trades.csv",
+        "./activity-exports/all-trades.csv",
+        "strategy-scripts/activity-exports/all-trades.csv",
+      ];
+      const charts = [];
+      const statusEl = document.getElementById("status");
+      const marketsContainer = document.getElementById("markets");
+      const zoomPlugin =
+        (window["chartjs-plugin-zoom"] && (window["chartjs-plugin-zoom"].default || window["chartjs-plugin-zoom"])) ||
+        window.ChartZoom ||
+        null;
+ 
+      const STYLE_MAP = {
+        "Buy-Up": { color: "#00c853", point: "cross", label: "Buy YES" },
+        "Sell-Up": { color: "#00e676", point: "circle", label: "Sell YES" },
+        "Buy-Down": { color: "#d000d0", point: "cross", label: "Buy NO" },
+        "Sell-Down": { color: "#ef4444", point: "circle", label: "Sell NO" },
+      };
+ 
+      document.getElementById("file-input").addEventListener("change", (event) => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const text = e.target?.result;
+          if (typeof text === "string") renderCsv(text, file.name);
+        };
+        reader.readAsText(file);
+      });
+      document.getElementById("reset-zoom").addEventListener("click", () => {
+        charts.forEach((chart) => {
+          if (chart.resetZoom) chart.resetZoom();
+        });
+      });
+ 
+      loadDefault();
+ 
+      async function loadDefault() {
+        if (window.Chart && zoomPlugin) {
+          Chart.register(zoomPlugin);
+        }
+        for (const url of DEFAULT_PATHS) {
+          const text = await loadFromUrl(url);
+          if (text !== null) return;
+        }
+        setStatus("Failed to load default CSV. Use the file picker or adjust your server path.");
+      }
+ 
+      async function loadFromUrl(url) {
+        setStatus(`Loading ${url} ...`);
+        try {
+          const response = await fetch(url);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const text = await response.text();
+          renderCsv(text, url);
+          return text;
+        } catch (err) {
+          console.warn(`Fetch failed for ${url}:`, err);
+          setStatus(`Failed to load ${url}: ${err.message}`);
+          return null;
+        }
+      }
+ 
+      function renderCsv(text, sourceLabel) {
+        destroyCharts();
+        marketsContainer.innerHTML = "";
+ 
+        if (typeof Chart === "undefined") {
+          setStatus("Chart.js failed to load (check internet/CDN).");
+          return;
+        }
+ 
+        try {
+        const rows = parseCsv(text);
+        const trades = normalizeTrades(rows);
+        if (!trades.length) {
+          setStatus("No trades found in file.");
+          return;
+        }
+ 
+        setStatus(`Loaded ${trades.length} rows from ${sourceLabel}`);
+ 
+        const byMarket = groupBy(trades, (t) => t.market);
+        for (const [market, items] of byMarket.entries()) {
+          const section = document.createElement("section");
+          section.className = "panel";
+          const outcomeCount = new Set(items.map((t) => t.outcomeLabel)).size;
+          section.innerHTML = `
+            <h2>${market}</h2>
+            <p class="market-meta">${items.length} trades • ${outcomeCount} outcomes</p>
+            <div class="chart-wrap"><canvas data-role="trades"></canvas></div>
+            <div class="chart-wrap"><canvas data-role="cumulative"></canvas></div>
+            <div class="chart-wrap"><canvas data-role="exposure-usd"></canvas></div>
+            <div class="chart-wrap"><canvas data-role="exposure-sh"></canvas></div>
+          `;
+          marketsContainer.appendChild(section);
+ 
+          const tradesChart = makeTradesChart(section.querySelector('canvas[data-role="trades"]'), items);
+          const cumulativeChart = makeCumulativeChart(section.querySelector('canvas[data-role="cumulative"]'), items);
+          const exposureUsdChart = makeExposureUsdChart(section.querySelector('canvas[data-role="exposure-usd"]'), items);
+          const exposureShChart = makeExposureSharesChart(section.querySelector('canvas[data-role="exposure-sh"]'), items);
+          [tradesChart, cumulativeChart, exposureUsdChart, exposureShChart].forEach(attachDragPan);
+          charts.push(tradesChart, cumulativeChart, exposureUsdChart, exposureShChart);
+        }
+      } catch (err) {
+        console.error("Render error:", err);
+        setStatus(`Failed to render charts: ${err.message || err}`);
+      }
+      }
+ 
+      function parseCsv(text) {
+        const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter(Boolean);
+        if (!lines.length) return [];
+        const headers = splitCsvLine(lines[0]);
+        const rows = [];
+        for (let i = 1; i < lines.length; i++) {
+          const cols = splitCsvLine(lines[i]);
+          if (!cols.length) continue;
+          const row = {};
+          headers.forEach((h, idx) => {
+            row[h] = cols[idx] ?? "";
+          });
+          rows.push(row);
+        }
+        return rows;
+      }
+ 
+      function splitCsvLine(line) {
+        const result = [];
+        let current = "";
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+          const char = line[i];
+          const next = line[i + 1];
+          if (char === '"' && inQuotes && next === '"') {
+            current += '"';
+            i++;
+          } else if (char === '"') {
+            inQuotes = !inQuotes;
+          } else if (char === "," && !inQuotes) {
+            result.push(current);
+            current = "";
+          } else {
+            current += char;
+          }
+        }
+        result.push(current);
+        return result;
+      }
+ 
+      function normalizeTrades(rows) {
+        const normalized = [];
+        for (const row of rows) {
+          const ts = parseTimestamp(row.timestampIso || row.timestamp);
+          if (!ts) continue;
+          const rawPrice = Number(row.price);
+          if (!Number.isFinite(rawPrice)) continue;
+          const shares = Number(row.size ?? row.shares ?? row.amount) || 0;
+          const cost = rawPrice * shares;
+          const priceCents = rawPrice * 100;
+          const outcomeRaw = row.outcome || row.outcomeName || row.outcomeSlug || (row.outcomeIndex ? `Outcome ${row.outcomeIndex}` : "");
+          const direction = normalizeDirection(outcomeRaw);
+          const action = normalizeAction(row.side || row.type || row.action);
+          const market = row.marketQuestion || row.question || row.title || row.searchQuery || "Unknown market";
+ 
+          normalized.push({
+            ts,
+            price: priceCents,
+            priceRaw: rawPrice,
+            shares,
+            cost,
+            direction,
+            action,
+            outcomeLabel: outcomeRaw || (direction === "Up" ? "YES" : "NO"),
+            market,
+          });
+        }
+        return normalized.sort((a, b) => a.ts - b.ts);
+      }
+ 
+      function parseTimestamp(raw) {
+        if (raw === undefined || raw === null) return null;
+        if (typeof raw === "number") {
+          if (raw > 1e12) return raw;          // already ms
+          if (raw > 1e9) return Math.round(raw * 1000); // seconds -> ms
+          return raw * 1000;                   // seconds (small) -> ms
+        }
+        const text = String(raw).trim();
+        if (!text) return null;
+        if (/^\d{13}$/.test(text)) return Number(text);        // ms
+        if (/^\d{10}$/.test(text)) return Number(text) * 1000; // seconds
+        const date = new Date(text);
+        return Number.isNaN(date.getTime()) ? null : date.getTime();
+      }
+ 
+      function normalizeAction(raw) {
+        const val = String(raw || "").toLowerCase();
+        if (val.includes("sell") || val.includes("redeem") || val.includes("short")) return "Sell";
+        if (val.includes("buy") || val.includes("long") || val.includes("bid")) return "Buy";
+        return "Buy";
+      }
+ 
+      function normalizeDirection(raw) {
+        const val = String(raw || "").toLowerCase();
+        if (!val) return "Up";
+        if (val.includes("yes") || val.includes("up") || val.includes("for") || val.includes("true")) return "Up";
+        return "Down";
+      }
+ 
+      function makeTradesChart(canvas, trades) {
+        const grouped = groupBy(trades, (t) => t.ts);
+        const singlesByKey = new Map();
+        const groupedPoints = [];
+        const volYes = [];
+        const volNo = [];
+ 
+        for (const [ts, group] of grouped.entries()) {
+          const yesBuyVol = group.filter((t) => t.action === "Buy" && t.direction === "Up").reduce((acc, t) => acc + t.shares, 0);
+          const noBuyVol = group.filter((t) => t.action === "Buy" && t.direction === "Down").reduce((acc, t) => acc + t.shares, 0);
+          volYes.push({ x: ts, y: yesBuyVol });
+          volNo.push({ x: ts, y: noBuyVol });
+ 
+          if (group.length === 1) {
+            const t = group[0];
+            const key = `${t.action}-${t.direction}`;
+            if (!singlesByKey.has(key)) singlesByKey.set(key, []);
+            singlesByKey.get(key).push({
+              x: ts,
+              y: t.price,
+              shares: t.shares,
+              cost: t.cost,
+              action: t.action,
+              direction: t.direction,
+            });
+          } else {
+            const avgPrice = group.reduce((acc, t) => acc + t.price, 0) / group.length;
+            groupedPoints.push({
+              x: ts,
+              y: avgPrice,
+              count: group.length,
+              trades: group,
+            });
+          }
+        }
+ 
+        const datasets = [];
+        for (const [key, points] of singlesByKey.entries()) {
+          const style = STYLE_MAP[key] || { color: "#94a3b8", point: "circle", label: key };
+          datasets.push({
+            label: style.label,
+            data: points,
+            parsing: false,
+            showLine: false,
+            borderColor: style.color,
+            backgroundColor: style.color,
+            pointStyle: style.point,
+            pointRadius: (ctx) => radiusForShares(ctx.raw?.shares),
+            pointHoverRadius: (ctx) => radiusForShares(ctx.raw?.shares) + 2,
+            yAxisID: "price",
+          });
+        }
+ 
+        if (groupedPoints.length) {
+          datasets.push({
+            label: "Grouped trades (same timestamp)",
+            data: groupedPoints,
+            parsing: false,
+            showLine: false,
+            borderColor: "#cbd5e1",
+            backgroundColor: "rgba(255,255,255,0.8)",
+            pointRadius: (ctx) => radiusForGroup(ctx.raw?.count),
+            pointHoverRadius: (ctx) => radiusForGroup(ctx.raw?.count) + 2,
+            pointStyle: "circle",
+            yAxisID: "price",
+          });
+        }
+ 
+        datasets.push(
+          {
+            type: "bar",
+            label: "Buy YES volume",
+            data: volYes,
+            parsing: false,
+            backgroundColor: "rgba(34,197,94,0.18)",
+            borderColor: "rgba(34,197,94,0.4)",
+            yAxisID: "volume",
+            stack: "volume",
+            barPercentage: 1,
+            categoryPercentage: 1,
+          },
+          {
+            type: "bar",
+            label: "Buy NO volume",
+            data: volNo,
+            parsing: false,
+            backgroundColor: "rgba(248,113,113,0.18)",
+            borderColor: "rgba(248,113,113,0.4)",
+            yAxisID: "volume",
+            stack: "volume",
+            barPercentage: 1,
+            categoryPercentage: 1,
+          }
+        );
+ 
+        return new Chart(canvas, {
+          type: "scatter",
+          data: { datasets },
+          options: baseChartOptions({
+            title: "Trades (price in cents) with buy volume per timestamp",
+            yLabel: "Price (cents)",
+            axes: {
+              price: { position: "left", min: 0, max: 110 },
+              volume: { position: "right", display: false, stacked: true },
+            },
+            tooltipLabel: (ctx) => {
+              const raw = ctx.raw || {};
+              if (ctx.dataset.type === "bar") {
+                return `${ctx.dataset.label}: ${formatNumber(raw.y)} sh`;
+              }
+              if (raw.count) {
+                const top = raw.trades
+                  .slice(0, 5)
+                  .map((t) => `${t.shares.toFixed(2)} sh @ ${t.price.toFixed(2)}c (${t.action} ${t.direction})`)
+                  .join("\n");
+                const extra = raw.trades.length > 5 ? `\n... +${raw.trades.length - 5} more` : "";
+                return [`${raw.count} trades @ ${raw.y.toFixed(2)}c`, top + extra, new Date(raw.x).toLocaleString()];
+              }
+              return [
+                `${ctx.dataset.label}`,
+                `${raw.y?.toFixed ? raw.y.toFixed(2) : raw.y}c`,
+                `${formatNumber(raw.shares)} sh / $${raw.cost?.toFixed ? raw.cost.toFixed(2) : raw.cost ?? "?"}`,
+                new Date(raw.x).toLocaleString(),
+              ];
+            },
+          }),
+        });
+      }
+ 
+      function makeCumulativeChart(canvas, trades) {
+        let cumYes = 0;
+        let cumNo = 0;
+        let cumYesCost = 0;
+        let cumNoCost = 0;
+        const yesSeries = [];
+        const noSeries = [];
+        const yesCostSeries = [];
+        const noCostSeries = [];
+ 
+        for (const t of trades) {
+          if (t.action === "Buy") {
+            if (t.direction === "Up") {
+              cumYes += t.shares;
+              cumYesCost += t.cost;
+            } else {
+              cumNo += t.shares;
+              cumNoCost += t.cost;
+            }
+          }
+          yesSeries.push({ x: t.ts, y: cumYes });
+          noSeries.push({ x: t.ts, y: cumNo });
+          yesCostSeries.push({ x: t.ts, y: cumYesCost });
+          noCostSeries.push({ x: t.ts, y: cumNoCost });
+        }
+ 
+        return new Chart(canvas, {
+          type: "line",
+          data: {
+            datasets: [
+              {
+                label: "Cumulative Buy YES (sh)",
+                data: yesSeries,
+                parsing: false,
+                borderColor: "rgba(34,197,94,0.6)",
+                backgroundColor: "rgba(34,197,94,0.14)",
+                fill: true,
+                tension: 0.2,
+                pointRadius: 0,
+                yAxisID: "shares",
+              },
+              {
+                label: "Cumulative Buy NO (sh)",
+                data: noSeries,
+                parsing: false,
+                borderColor: "rgba(244,63,94,0.6)",
+                backgroundColor: "rgba(244,63,94,0.12)",
+                fill: true,
+                tension: 0.2,
+                pointRadius: 0,
+                yAxisID: "shares",
+              },
+              {
+                label: "Cumulative Buy YES ($)",
+                data: yesCostSeries,
+                parsing: false,
+                borderColor: "rgba(34,197,94,0.85)",
+                borderDash: [6, 6],
+                pointRadius: 0,
+                tension: 0.2,
+                yAxisID: "cost",
+              },
+              {
+                label: "Cumulative Buy NO ($)",
+                data: noCostSeries,
+                parsing: false,
+                borderColor: "rgba(244,63,94,0.85)",
+                borderDash: [6, 6],
+                pointRadius: 0,
+                tension: 0.2,
+                yAxisID: "cost",
+              },
+            ],
+          },
+          options: baseChartOptions({
+            title: "Cumulative buys (shares + cost)",
+            yLabel: "Shares",
+            axes: {
+              shares: { position: "left", stacked: false, min: 0 },
+              cost: { position: "right", grid: { drawOnChartArea: false }, title: "Cost ($)" },
+            },
+            tooltipLabel: (ctx) => {
+              const raw = ctx.raw || {};
+              return [ctx.dataset.label, `${formatNumber(raw.y)}`, new Date(raw.x).toLocaleString()];
+            },
+          }),
+        });
+      }
+ 
+      function makeExposureUsdChart(canvas, trades) {
+        let yesExp = 0;
+        let noExp = 0;
+        const yesSeries = [];
+        const noSeries = [];
+        const netSeries = [];
+ 
+        for (const t of trades) {
+          if (t.direction === "Up") {
+            yesExp += t.action === "Buy" ? t.cost : -t.cost;
+          } else {
+            noExp += t.action === "Buy" ? t.cost : -t.cost;
+          }
+          yesSeries.push({ x: t.ts, y: yesExp });
+          noSeries.push({ x: t.ts, y: noExp });
+          netSeries.push({ x: t.ts, y: yesExp + noExp });
+        }
+ 
+        return new Chart(canvas, {
+          type: "line",
+          data: {
+            datasets: [
+              {
+                label: "YES exposure ($)",
+                data: yesSeries,
+                parsing: false,
+                borderColor: "rgba(34,197,94,0.9)",
+                tension: 0.15,
+                pointRadius: 0,
+              },
+              {
+                label: "NO exposure ($)",
+                data: noSeries,
+                parsing: false,
+                borderColor: "rgba(248,113,113,0.9)",
+                tension: 0.15,
+                pointRadius: 0,
+              },
+              {
+                label: "NET exposure ($)",
+                data: netSeries,
+                parsing: false,
+                borderColor: "rgba(96,165,250,0.9)",
+                borderDash: [4, 4],
+                tension: 0.15,
+                pointRadius: 0,
+              },
+            ],
+          },
+          options: baseChartOptions({
+            title: "Dollar exposure (buys minus sells)",
+            yLabel: "Exposure ($)",
+            axes: { y: { position: "left" } },
+            tooltipLabel: (ctx) => {
+              const raw = ctx.raw || {};
+              return [ctx.dataset.label, `$${formatNumber(raw.y)}`, new Date(raw.x).toLocaleString()];
+            },
+          }),
+        });
+      }
+ 
+      function makeExposureSharesChart(canvas, trades) {
+        let yesSh = 0;
+        let noSh = 0;
+        const yesSeries = [];
+        const noSeries = [];
+        const netSeries = [];
+ 
+        for (const t of trades) {
+          if (t.direction === "Up") {
+            yesSh += t.action === "Buy" ? t.shares : -t.shares;
+          } else {
+            noSh += t.action === "Buy" ? t.shares : -t.shares;
+          }
+          yesSeries.push({ x: t.ts, y: yesSh });
+          noSeries.push({ x: t.ts, y: noSh });
+          netSeries.push({ x: t.ts, y: yesSh + noSh });
+        }
+ 
+        return new Chart(canvas, {
+          type: "line",
+          data: {
+            datasets: [
+              {
+                label: "YES exposure (shares)",
+                data: yesSeries,
+                parsing: false,
+                borderColor: "rgba(34,197,94,0.9)",
+                tension: 0.15,
+                pointRadius: 0,
+              },
+              {
+                label: "NO exposure (shares)",
+                data: noSeries,
+                parsing: false,
+                borderColor: "rgba(248,113,113,0.9)",
+                tension: 0.15,
+                pointRadius: 0,
+              },
+              {
+                label: "NET exposure (shares)",
+                data: netSeries,
+                parsing: false,
+                borderColor: "rgba(96,165,250,0.9)",
+                borderDash: [4, 4],
+                tension: 0.15,
+                pointRadius: 0,
+              },
+            ],
+          },
+          options: baseChartOptions({
+            title: "Shares exposure (buys minus sells)",
+            yLabel: "Shares",
+            axes: { y: { position: "left" } },
+            tooltipLabel: (ctx) => {
+              const raw = ctx.raw || {};
+              return [ctx.dataset.label, `${formatNumber(raw.y)} sh`, new Date(raw.x).toLocaleString()];
+            },
+          }),
+        });
+      }
+ 
+      // Simple click-drag pan on the x-axis; wheel/pinch zoom stays via plugin.
+      function attachDragPan(chart) {
+        const canvas = chart?.canvas;
+        if (!canvas || !chart.scales?.x) return;
+ 
+        let isDragging = false;
+        let startXVal = 0;
+        let startXMin = 0;
+        let startXMax = 0;
+        let startYState = [];
+ 
+        function onDown(evt) {
+          if (evt.button !== 0) return; // left click only
+          const scaleX = chart.scales.x;
+          if (!scaleX) return;
+          isDragging = true;
+          startXVal = scaleX.getValueForPixel(evt.offsetX) ?? 0;
+          startXMin = scaleX.min ?? scaleX._userMin ?? scaleX._minVisible ?? scaleX.getValueForPixel(scaleX.left);
+          startXMax = scaleX.max ?? scaleX._userMax ?? scaleX._maxVisible ?? scaleX.getValueForPixel(scaleX.right);
+          startYState = Object.values(chart.scales)
+            .filter((s) => s.axis === "y")
+            .map((s) => ({
+              id: s.id,
+              startVal: s.getValueForPixel(evt.offsetY) ?? 0,
+              min: s.min ?? s._userMin ?? s._minVisible ?? s.getValueForPixel(s.top ?? s.bottom ?? 0),
+              max: s.max ?? s._userMax ?? s._maxVisible ?? s.getValueForPixel(s.bottom ?? s.top ?? 0),
+            }));
+          canvas.style.cursor = "grabbing";
+        }
+ 
+        function onMove(evt) {
+          if (!isDragging) return;
+          const scaleX = chart.scales.x;
+          if (!scaleX) return;
+          const currentX = scaleX.getValueForPixel(evt.offsetX);
+          if (currentX == null || Number.isNaN(currentX)) return;
+          const deltaX = currentX - startXVal;
+          chart.options.scales.x.min = startXMin - deltaX;
+          chart.options.scales.x.max = startXMax - deltaX;
+ 
+          startYState.forEach((s) => {
+            const scale = chart.scales[s.id];
+            if (!scale) return;
+            const currentY = scale.getValueForPixel(evt.offsetY);
+            if (currentY == null || Number.isNaN(currentY)) return;
+            const deltaY = currentY - s.startVal;
+            chart.options.scales[scale.id].min = s.min - deltaY;
+            chart.options.scales[scale.id].max = s.max - deltaY;
+          });
+ 
+          chart.update("none");
+        }
+ 
+        function endDrag() {
+          if (!isDragging) return;
+          isDragging = false;
+          canvas.style.cursor = "default";
+        }
+ 
+        canvas.addEventListener("mousedown", onDown);
+        canvas.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", endDrag);
+        canvas.addEventListener("mouseleave", endDrag);
+      }
+ 
+      function baseChartOptions({ title, yLabel, axes = {}, tooltipLabel }) {
+        return {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "nearest", axis: "x", intersect: false },
+          plugins: {
+            title: { display: true, text: title, color: "#e2e8f0", font: { size: 14, weight: "bold" } },
+            legend: { labels: { color: "#cbd5e1", boxWidth: 12 } },
+            tooltip: {
+              callbacks: {
+                label: (ctx) => (tooltipLabel ? tooltipLabel(ctx) : ctx.formattedValue),
+              },
+              backgroundColor: "rgba(15, 23, 42, 0.92)",
+              borderColor: "rgba(148, 163, 184, 0.4)",
+              borderWidth: 1,
+            },
+            zoom: zoomPlugin
+              ? {
+                  zoom: {
+                    wheel: { enabled: true },
+                    pinch: { enabled: true },
+                    mode: "xy",
+                  },
+                  pan: false, // handled by custom drag
+                  limits: {
+                    x: { minRange: 60 * 1000 }, // at least 1 min range when zooming
+                  },
+                }
+              : undefined,
+          },
+          scales: {
+            x: {
+              axis: "x",
+              type: "linear",
+              ticks: {
+                color: "#cbd5e1",
+                callback: (value) => formatTimeLabel(value),
+              },
+              grid: { color: "rgba(148, 163, 184, 0.18)" },
+              title: { display: true, text: "Time", color: "#cbd5e1" },
+            },
+            y: {
+              axis: "y",
+              position: "left",
+              ticks: { color: "#cbd5e1" },
+              grid: { color: "rgba(148, 163, 184, 0.18)" },
+              title: { display: true, text: yLabel, color: "#cbd5e1" },
+              ...(axes.y || {}),
+            },
+            price: {
+              axis: "y",
+              position: "left",
+              type: "linear",
+              ticks: { color: "#cbd5e1" },
+              grid: { color: "rgba(148, 163, 184, 0.18)" },
+              title: { display: true, text: "Price (cents)", color: "#cbd5e1" },
+              ...(axes.price || {}),
+            },
+            volume: {
+              axis: "y",
+              position: "right",
+              type: "linear",
+              display: false,
+              ticks: { color: "#cbd5e1" },
+              grid: { drawOnChartArea: false },
+              ...(axes.volume || {}),
+            },
+            shares: {
+              axis: "y",
+              position: "left",
+              type: "linear",
+              ticks: { color: "#cbd5e1" },
+              grid: { color: "rgba(148, 163, 184, 0.18)" },
+              title: { display: true, text: "Shares", color: "#cbd5e1" },
+              ...(axes.shares || {}),
+            },
+            cost: {
+              axis: "y",
+              type: "linear",
+              position: "right",
+              ticks: { color: "#cbd5e1" },
+              grid: { drawOnChartArea: false },
+              title: { display: true, text: axes.cost?.title || "Cost ($)", color: "#cbd5e1" },
+              ...(axes.cost || {}),
+            },
+          },
+        };
+      }
+ 
+      function groupBy(items, keyFn) {
+        const map = new Map();
+        for (const item of items) {
+          const key = typeof keyFn === "function" ? keyFn(item) : item[keyFn];
+          if (!map.has(key)) map.set(key, []);
+          map.get(key).push(item);
+        }
+        return map;
+      }
+ 
+      function formatTimeLabel(value) {
+        const d = new Date(Number(value));
+        if (Number.isNaN(d.getTime())) return "";
+        return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      }
+ 
+      function radiusForShares(shares) {
+        const v = Math.abs(Number(shares) || 0);
+        return Math.max(3, Math.min(16, Math.sqrt(v) * 0.8 + 3));
+      }
+ 
+      function radiusForGroup(count) {
+        const c = Number(count) || 1;
+        return Math.max(8, Math.min(22, Math.sqrt(c) * 4 + 4));
+      }
+ 
+      function formatNumber(value) {
+        const num = Number(value) || 0;
+        if (Math.abs(num) >= 1000000) return `${(num / 1000000).toFixed(2)}m`;
+        if (Math.abs(num) >= 1000) return `${(num / 1000).toFixed(2)}k`;
+        return num.toFixed(2);
+      }
+ 
+      function destroyCharts() {
+        charts.forEach((chart) => chart.destroy());
+        charts.length = 0;
+      }
+ 
+      function setStatus(message) {
+        statusEl.textContent = message;
+      }
+    })();
+  </script>
+</body>
+</html>
+ 
