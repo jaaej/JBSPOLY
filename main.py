@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
@@ -98,15 +99,57 @@ def fetch_games(api_key: str) -> list[str]:
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Failed to fetch games: {exc}") from exc
 
-    if isinstance(payload, dict) and "games" in payload:
-        games = payload["games"]
-    else:
-        games = payload
+    if isinstance(payload, dict):
+        for key in ("games", "data", "events", "results"):
+            if key in payload:
+                payload = payload[key]
+                break
+        else:
+            if any(k in payload for k in ("error", "message", "status")):
+                raise RuntimeError(f"Failed to fetch games: {payload}")
+            payload = list(payload.values())
 
-    if not isinstance(games, list):
+    if not isinstance(payload, list):
         raise RuntimeError("Unexpected games payload format")
 
-    return [str(game) for game in games]
+    games: list[str] = []
+    for item in payload:
+        if isinstance(item, str):
+            games.append(item)
+            continue
+        if isinstance(item, dict):
+            for key in ("game", "event", "name", "matchup", "title"):
+                value = item.get(key)
+                if value:
+                    games.append(str(value))
+                    break
+
+    if not games:
+        raise RuntimeError("No games found in payload")
+
+    return games
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _filter_games(games: list[str], query: str) -> list[str]:
+    query_norm = _normalize(query)
+    if not query_norm:
+        return []
+
+    matches = [game for game in games if query_norm in _normalize(game)]
+    if matches:
+        return matches
+
+    tokens = [token for token in query_norm.split() if token != "vs"]
+    if not tokens:
+        return []
+
+    return [
+        game for game in games if any(token in _normalize(game) for token in tokens)
+    ]
 
 
 def choose_game(games: list[str] | None, exact_name: str | None) -> str:
@@ -116,23 +159,46 @@ def choose_game(games: list[str] | None, exact_name: str | None) -> str:
         raise RuntimeError("Game not found. Use exact name from the list.")
 
     if games:
-        print("Available games:", flush=True)
-        for game in games:
-            print(f"- {game}", flush=True)
-    else:
-        print(
-            "Unable to fetch game list; enter the exact game name anyway.",
-            flush=True,
-        )
+        query = input("Search game (e.g., 'Brooklyn Nets vs New York Knicks'): ").strip()
+        if not query:
+            raise RuntimeError("Search query required.")
+        matches = _filter_games(games, query)
+        if not matches:
+            raise RuntimeError("No matches found. Use exact name from the list.")
+        if len(matches) == 1:
+            candidate = matches[0]
+        else:
+            print("Matches:", flush=True)
+            for idx, game in enumerate(matches, start=1):
+                print(f"{idx}. {game}", flush=True)
+            choice = input("Pick a number from the list: ").strip()
+            if not choice.isdigit():
+                raise RuntimeError("Invalid selection.")
+            idx = int(choice) - 1
+            if idx < 0 or idx >= len(matches):
+                raise RuntimeError("Invalid selection.")
+            candidate = matches[idx]
 
+        confirm = input(f"Subscribe to '{candidate}'? [y/N]: ").strip().lower()
+        if confirm == "y":
+            return candidate
+        raise RuntimeError("Cancelled.")
+
+    print(
+        "Unable to fetch game list; enter the exact game name anyway.",
+        flush=True,
+    )
     selection = input("Type the exact game name to subscribe: ").strip()
-    if not games or selection in games:
+    if selection:
         return selection
+    raise RuntimeError("Game name required.")
 
-    raise RuntimeError("Game not found. Use exact name from the list.")
 
-
-async def stream_scores(ws_url: str, game_name: str | None) -> None:
+async def stream_scores(
+    ws_url: str,
+    game_name: str | None,
+    show_raw: bool,
+) -> None:
     backoff = 0.5
     backoff_max = 10.0
     policy_backoff = 30.0
@@ -148,6 +214,8 @@ async def stream_scores(ws_url: str, game_name: str | None) -> None:
                 close_timeout=5,
                 compression=None,
             ) as websocket:
+                ack_message = await websocket.recv()
+                print(ack_message, flush=True)
                 print("Connected. Streaming live updates...", flush=True)
                 backoff = 0.5
                 if game_name:
@@ -160,6 +228,8 @@ async def stream_scores(ws_url: str, game_name: str | None) -> None:
                     formatted = format_new_play(message)
                     if formatted:
                         print(formatted, flush=True)
+                    elif show_raw:
+                        print(message, flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -195,6 +265,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Exact game name to subscribe (if omitted, prompt)",
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print raw messages that do not match new_play",
+    )
     return parser.parse_args()
 
 
@@ -221,7 +296,7 @@ def main() -> None:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
     try:
-        asyncio.run(stream_scores(ws_url, game_name))
+        asyncio.run(stream_scores(ws_url, game_name, args.raw))
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
 
